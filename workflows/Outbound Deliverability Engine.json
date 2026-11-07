@@ -1,0 +1,879 @@
+{
+  "name": "Outbound Deliverability Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "outbound-deliverability",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "4dc46451-8d8d-41ad-bcdf-cda5a969389e",
+      "name": "Webhook Ingestion",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        208
+      ],
+      "webhookId": "7c1d9a52-3b0e-4f3a-9d1e-5a0b1c2d3e4f"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst headers = input.headers || {};\nconst body = input.body === undefined || input.body === null ? {} : input.body;\nconst errors = [];\nlet httpStatus = 202;\nconst secret = $env.WEBHOOK_SHARED_SECRET || '';\nif (secret && headers['x-webhook-secret'] !== secret) { errors.push('unauthorized: missing or invalid x-webhook-secret header'); httpStatus = 401; }\nconst leads = Array.isArray(body) ? body : (Array.isArray(body.leads) ? body.leads : null);\nconst meta = Array.isArray(body) ? {} : body;\nconst maxBatch = Number($env.MAX_BATCH_SIZE || 500);\nif (!leads) { errors.push('payload must be an array of leads or an object containing a leads array'); if (httpStatus === 202) httpStatus = 400; }\nelse if (leads.length === 0) { errors.push('leads array is empty'); if (httpStatus === 202) httpStatus = 400; }\nelse if (leads.length > maxBatch) { errors.push('batch exceeds MAX_BATCH_SIZE of ' + maxBatch); if (httpStatus === 202) httpStatus = 413; }\nconst csv = (v) => String(v || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\nconst list = (v, fallback) => (Array.isArray(v) && v.length ? v.map((s) => String(s).trim().toLowerCase()).filter(Boolean) : csv(fallback));\nreturn [{ json: { valid: errors.length === 0, http_status: httpStatus, errors, batch_id: String(meta.batch_id || 'batch-' + Date.now()), campaign_id: String(meta.campaign_id || 'unassigned'), received_at: new Date().toISOString(), lead_count: leads ? leads.length : 0, sending_domains: list(meta.sending_domains, $env.SENDING_DOMAINS), sending_ips: list(meta.sending_ips, $env.SENDING_IPS), leads: leads || [] } }];"
+      },
+      "id": "923e836b-72c3-45e1-bc2f-57c625b02285",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -128,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "valid-check-0001",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "76846610-7425-4959-905f-0869cb6d099b",
+      "name": "Payload Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        112,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'accepted', batch_id: $json.batch_id, lead_count: $json.lead_count, sending_domains: $json.sending_domains } }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "091c4307-7478-450b-a840-70d2c0ce69cc",
+      "name": "Respond 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        352,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', errors: $json.errors } }}",
+        "options": {
+          "responseCode": "={{ $json.http_status }}"
+        }
+      },
+      "id": "3008fbb9-09d1-4188-8d67-b3c578cb8ba7",
+      "name": "Respond 4xx Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        352,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const batch = $('Validate Payload').first().json;\nconst provider = String($env.VERIFICATION_PROVIDER || 'zerobounce').toLowerCase() === 'bounceban' ? 'bounceban' : 'zerobounce';\nconst sandbox = String($env.SANDBOX_MODE || 'false').toLowerCase() === 'true';\nconst roles = ['info','admin','support','sales','contact','hello','office','billing','hr','jobs','careers','marketing','team','help','webmaster','hostmaster','noreply','no-reply','enquiries','inquiries','press','legal','accounts','finance'];\nconst trapContains = ['spamtrap','spam-trap','spam_trap','honeypot','honey-pot','blackhole','devnull','mailer-daemon'];\nconst trapExact = ['abuse','postmaster','bounce','bounces','trap','spam','unsubscribe'];\nconst disposable = ['mailinator.com','guerrillamail.com','10minutemail.com','tempmail.com','yopmail.com','trashmail.com','sharklasers.com','getnada.com','throwawaymail.com','temp-mail.org'];\nconst reservedDomains = ['example.com','example.org','example.net','localhost','invalid','test'];\nconst reservedTlds = ['test','example','invalid','localhost'];\nconst freemail = ['gmail.com','yahoo.com','outlook.com','hotmail.com','icloud.com','aol.com','proton.me','protonmail.com','live.com','gmx.com'];\nconst seen = new Set();\nlet dropped = 0;\nconst out = [];\nbatch.leads.forEach((entry, idx) => {\n  const raw = entry && typeof entry === 'object' ? entry : {};\n  const email = String(raw.email || '').trim().toLowerCase();\n  const at = email.lastIndexOf('@');\n  const local = at > 0 ? email.slice(0, at) : '';\n  const domain = at >= 0 ? email.slice(at + 1).trim() : '';\n  if (email && seen.has(email)) { dropped += 1; return; }\n  if (email) seen.add(email);\n  const syntaxValid = at > 0 && email.indexOf('@') === at && !email.includes(' ') && domain.includes('.') && !domain.includes('..') && !domain.startsWith('.') && !domain.endsWith('.') && domain.length > 3;\n  const roleBased = roles.includes(local);\n  const trap = trapContains.some((t) => local.includes(t)) || trapExact.includes(local);\n  const isReserved = reservedDomains.includes(domain) || reservedTlds.includes(domain.split('.').pop());\n  let hard = '';\n  if (!email) hard = 'missing_email';\n  else if (at < 0) hard = 'invalid_syntax';\n  else if (!domain) hard = 'missing_domain';\n  else if (!syntaxValid) hard = 'invalid_syntax';\n  else if (isReserved && !sandbox) hard = 'reserved_domain';\n  else if (disposable.includes(domain)) hard = 'disposable_domain';\n  else if (trap) hard = 'trap_pattern';\n  out.push({ json: { lead_id: String(raw.lead_id || batch.batch_id + '-' + (idx + 1)), batch_id: batch.batch_id, campaign_id: batch.campaign_id, email, local_part: local, domain, first_name: raw.first_name || '', last_name: raw.last_name || '', company: raw.company || '', source: raw.source || '', provider, role_based: roleBased, free_email: freemail.includes(domain), syntax_valid: syntaxValid, hard_reject_reason: hard, sending_domains: batch.sending_domains, sending_ips: batch.sending_ips } });\n});\nreturn out.map((item) => ({ json: { ...item.json, duplicates_dropped: dropped } }));"
+      },
+      "id": "c15c39c1-b0ca-43ab-9593-bc5163309d33",
+      "name": "Prepare Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const helpers = this.helpers;\nconst items = $input.all();\nconst endpoint = $env.DNS_DOH_ENDPOINT || 'https://dns.google/resolve';\nconst dohHeaders = { accept: 'application/dns-json' };\nif ($env.DNS_DOH_API_KEY) dohHeaders.Authorization = 'Bearer ' + $env.DNS_DOH_API_KEY;\nconst sandbox = String($env.SANDBOX_MODE || 'false').toLowerCase() === 'true';\nconst typeNum = { A: 1, MX: 15, TXT: 16, AAAA: 28 };\nconst cache = new Map();\nconst query = (name, type) => {\n  const key = type + ':' + name;\n  if (!cache.has(key)) {\n    cache.set(key, (async () => {\n      let lastError = '';\n      for (let attempt = 0; attempt < 3; attempt++) {\n        try {\n          const res = await helpers.httpRequest({ method: 'GET', url: endpoint, qs: { name, type }, headers: dohHeaders, json: true, timeout: 8000 });\n          return { ok: true, status: res.Status, answers: (res.Answer || []).filter((a) => a.type === typeNum[type]) };\n        } catch (e) { lastError = e.message; }\n      }\n      return { ok: false, status: -1, answers: [], error: lastError };\n    })());\n  }\n  return cache.get(key);\n};\nconst txt = (r) => r.answers.map((a) => String(a.data).split('\" \"').join('').split('\"').join(''));\nconst csv = (v, d) => String(v || d).split(',').map((s) => s.trim()).filter(Boolean);\nconst mapLimit = async (arr, limit, fn) => { const out = []; for (let i = 0; i < arr.length; i += limit) { out.push(...(await Promise.all(arr.slice(i, i + limit).map(fn)))); } return out; };\nconst stripDot = (h) => (h.endsWith('.') ? h.slice(0, -1) : h).toLowerCase();\nconst checkMx = async (domain) => {\n  const r = await query(domain, 'MX');\n  if (!r.ok || (r.status !== 0 && r.status !== 3)) return { domain, mx_valid: null, reason: 'dns_lookup_failed', hosts: [] };\n  if (r.status === 3) return { domain, mx_valid: false, reason: 'nxdomain', hosts: [] };\n  const parsed = r.answers.map((a) => { const p = String(a.data).trim().split(' '); return { priority: Number(p[0]), host: stripDot(p[1] || '') }; });\n  if (!parsed.length) return { domain, mx_valid: false, reason: 'no_mx_records', hosts: [] };\n  const real = parsed.filter((h) => h.host).sort((a, b) => a.priority - b.priority).slice(0, 3);\n  if (!real.length) return { domain, mx_valid: false, reason: 'null_mx', hosts: [] };\n  const hosts = await Promise.all(real.map(async (h) => { const [a, aaaa] = await Promise.all([query(h.host, 'A'), query(h.host, 'AAAA')]); return { ...h, resolves: a.answers.length + aaaa.answers.length > 0, lookup_ok: a.ok && aaaa.ok }; }));\n  const anyResolves = hosts.some((h) => h.resolves);\n  const anyUnknown = hosts.some((h) => !h.lookup_ok);\n  return { domain, mx_valid: anyResolves ? true : (anyUnknown ? null : false), reason: anyResolves ? 'ok' : (anyUnknown ? 'dns_lookup_failed' : 'mx_hosts_unresolvable'), hosts };\n};\nconst domainZones = csv($env.DNSBL_DOMAIN_ZONES, 'dbl.spamhaus.org,multi.surbl.org,multi.uribl.com');\nconst ipZones = csv($env.DNSBL_IP_ZONES, 'zen.spamhaus.org,bl.spamcop.net');\nconst listing = async (name, zone) => {\n  const r = await query(name + '.' + zone, 'A');\n  if (!r.ok || (r.status !== 0 && r.status !== 3)) return { zone, listed: false, inconclusive: true, codes: [] };\n  const codes = r.answers.map((a) => String(a.data));\n  if (!codes.length) return { zone, listed: false, inconclusive: false, codes };\n  const blocked = codes.some((c) => c.startsWith('127.255.255.') || (zone.includes('uribl') && c === '127.0.0.1'));\n  return { zone, listed: !blocked, inconclusive: blocked, codes };\n};\nconst dkimSelectors = csv($env.DKIM_SELECTORS, 'google,selector1,selector2,default,k1,k2,s1,s2,mail,dkim');\nconst auditSender = async (domain) => {\n  const issues = [];\n  let score = 0;\n  const [mx, spfRes, dmarcRes, dkimRes, bl] = await Promise.all([\n    checkMx(domain),\n    query(domain, 'TXT'),\n    query('_dmarc.' + domain, 'TXT'),\n    Promise.all(dkimSelectors.map(async (s) => ({ selector: s, res: await query(s + '._domainkey.' + domain, 'TXT') }))),\n    Promise.all(domainZones.map((z) => listing(domain, z)))\n  ]);\n  const spfRecords = txt(spfRes).filter((t) => t.toLowerCase().startsWith('v=spf1'));\n  const spf = { present: spfRecords.length > 0, multiple: spfRecords.length > 1, record: spfRecords[0] || '', all: '', lookups: 0 };\n  if (!spf.present) { issues.push('SPF record missing'); }\n  else {\n    const parts = spf.record.toLowerCase().split(' ').filter(Boolean);\n    spf.all = parts.find((p) => ['-all', '~all', '?all', '+all', 'all'].includes(p)) || '';\n    spf.lookups = parts.filter((p) => p.startsWith('include:') || p.startsWith('redirect=') || p.startsWith('exists:') || p === 'a' || p.startsWith('a:') || p.startsWith('a/') || p === 'mx' || p.startsWith('mx:') || p.startsWith('mx/') || p.startsWith('ptr')).length;\n    if (spf.multiple) issues.push('Multiple SPF records published (permerror)'); else score += 15;\n    if (spf.all === '-all' || spf.all === '~all') score += 5; else issues.push('SPF terminal mechanism is weak or missing (' + (spf.all || 'none') + ')');\n    if (spf.lookups <= 10) score += 5; else issues.push('SPF exceeds 10 DNS lookups (' + spf.lookups + ' top-level)');\n  }\n  const dkimFound = dkimRes.map((d) => {\n    const rec = txt(d.res).find((t) => t.toLowerCase().includes('v=dkim1') || t.toLowerCase().includes('p='));\n    if (!rec) return null;\n    const tag = rec.split(';').map((x) => x.trim()).find((x) => x.toLowerCase().startsWith('p='));\n    return { selector: d.selector, revoked: !tag || tag.slice(2).trim() === '' };\n  }).filter(Boolean);\n  const validSelectors = dkimFound.filter((d) => !d.revoked).map((d) => d.selector);\n  if (validSelectors.length) score += 25; else issues.push('No active DKIM key at tested selectors (' + dkimSelectors.join(', ') + ')');\n  if (dkimFound.some((d) => d.revoked)) issues.push('Revoked DKIM key at selector(s): ' + dkimFound.filter((d) => d.revoked).map((d) => d.selector).join(', '));\n  const dmarcRecords = txt(dmarcRes).filter((t) => t.toLowerCase().startsWith('v=dmarc1'));\n  const tags = {};\n  if (dmarcRecords[0]) dmarcRecords[0].split(';').forEach((kv) => { const i = kv.indexOf('='); if (i > 0) tags[kv.slice(0, i).trim().toLowerCase()] = kv.slice(i + 1).trim(); });\n  const dmarc = { present: dmarcRecords.length > 0, policy: (tags.p || '').toLowerCase(), pct: tags.pct ? Number(tags.pct) : 100, rua: tags.rua || '' };\n  if (!dmarc.present) { issues.push('DMARC record missing'); }\n  else {\n    if (dmarc.policy === 'reject') score += 25;\n    else if (dmarc.policy === 'quarantine') score += 22;\n    else if (dmarc.policy === 'none') { score += 10; issues.push('DMARC policy is p=none (monitoring only)'); }\n    else issues.push('DMARC policy tag invalid or missing');\n    if (dmarc.pct < 100) { score -= 3; issues.push('DMARC pct is below 100'); }\n    if (!dmarc.rua) issues.push('DMARC has no rua reporting address');\n  }\n  if (mx.mx_valid === true) score += 10; else issues.push('Sending domain MX invalid or unverifiable (' + mx.reason + ')');\n  const listedOn = bl.filter((b) => b.listed).map((b) => b.zone);\n  const blStatus = listedOn.length ? 'listed' : (bl.every((b) => b.inconclusive) ? 'inconclusive' : 'clear');\n  if (blStatus === 'listed') issues.push('CRITICAL: domain listed on ' + listedOn.join(', '));\n  else if (blStatus === 'inconclusive') issues.push('Blacklist lookups inconclusive (resolver blocked or failed) - use a private resolver');\n  score += blStatus === 'clear' ? 15 : (blStatus === 'inconclusive' ? 8 : 0);\n  score = Math.max(0, Math.min(100, score));\n  const grade = score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';\n  return { domain, score, grade, mx, spf, dkim: { tested: dkimSelectors, valid_selectors: validSelectors, found: dkimFound }, dmarc, blacklist_status: blStatus, listed_on: listedOn, blacklist_checks: bl, issues };\n};\nconst checkIp = async (ip) => {\n  const octets = ip.split('.');\n  if (octets.length !== 4 || octets.some((o) => o === '' || isNaN(Number(o)) || Number(o) < 0 || Number(o) > 255)) return { ip, valid: false, listed_on: [], inconclusive: false, checks: [] };\n  const rev = octets.reverse().join('.');\n  const checks = await Promise.all(ipZones.map((z) => listing(rev, z)));\n  return { ip, valid: true, listed_on: checks.filter((c) => c.listed).map((c) => c.zone), inconclusive: checks.every((c) => c.inconclusive), checks };\n};\nconst first = items[0].json;\nconst minScore = Number($env.SENDER_MIN_SCORE || 70);\nconst domainAudits = await mapLimit(first.sending_domains || [], 5, auditSender);\nconst ipAudits = await mapLimit(first.sending_ips || [], 5, checkIp);\nlet gate = 'PASS';\nconst reasons = [];\nif (!domainAudits.length && !ipAudits.length) {\n  if (String($env.REQUIRE_SENDER_AUDIT || 'false').toLowerCase() === 'true') { gate = 'HOLD'; reasons.push('No sending domains supplied and REQUIRE_SENDER_AUDIT=true'); }\n  else { gate = 'UNVERIFIED'; reasons.push('No sending domains supplied; sender audit skipped'); }\n}\ndomainAudits.forEach((d) => {\n  if (d.blacklist_status === 'listed') { gate = 'HOLD'; reasons.push(d.domain + ' is blacklisted on ' + d.listed_on.join(', ')); }\n  else if (d.score < minScore) { gate = 'HOLD'; reasons.push(d.domain + ' health score ' + d.score + ' is below minimum ' + minScore); }\n  else if (d.issues.length && gate === 'PASS') { gate = 'WARN'; }\n});\nipAudits.forEach((i) => {\n  if (!i.valid) reasons.push('Invalid sending IP ignored: ' + i.ip);\n  else if (i.listed_on.length) { gate = 'HOLD'; reasons.push(i.ip + ' is blacklisted on ' + i.listed_on.join(', ')); }\n});\nconst toCheck = [...new Set(items.filter((i) => !i.json.hard_reject_reason).map((i) => i.json.domain))];\nconst mxResults = await mapLimit(toCheck, 10, checkMx);\nconst mxByDomain = Object.fromEntries(mxResults.map((m) => [m.domain, m]));\nconst verifyWhenHeld = String($env.VERIFY_WHEN_HELD || 'false').toLowerCase() === 'true';\nreturn items.map((item, idx) => {\n  const lead = item.json;\n  let hard = lead.hard_reject_reason;\n  const mx = hard ? null : mxByDomain[lead.domain];\n  if (!hard && mx && mx.mx_valid === false && !sandbox) hard = 'dns_' + mx.reason;\n  const needs = !hard && (gate !== 'HOLD' || verifyWhenHeld);\n  const out = { ...lead, hard_reject_reason: hard, dns: mx, needs_verification: needs, campaign_gate: gate, campaign_gate_reasons: reasons };\n  delete out.sending_domains;\n  delete out.sending_ips;\n  if (idx === 0) out.sender_health = { gate, reasons, min_score: minScore, audited_at: new Date().toISOString(), domains: domainAudits, ips: ipAudits };\n  return { json: out };\n});"
+      },
+      "id": "8f1b6cb0-81ff-4b40-b84a-9f2b80540f4b",
+      "name": "DNS Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const dns = $('DNS Check').first().json;\nconst batch = $('Validate Payload').first().json;\nconst health = dns.sender_health;\nconst NL = String.fromCharCode(10);\nconst checkedAt = health.audited_at;\nconst records = health.domains.map((d) => ({ type: 'domain_health', batch_id: batch.batch_id, campaign_id: batch.campaign_id, domain: d.domain, score: d.score, grade: d.grade, blacklist_status: d.blacklist_status, listed_on: d.listed_on, spf_present: d.spf.present, spf_all: d.spf.all, dkim_valid_selectors: d.dkim.valid_selectors, dmarc_policy: d.dmarc.policy, mx_valid: d.mx.mx_valid, issues: d.issues, checked_at: checkedAt })).concat(health.ips.map((i) => ({ type: 'ip_health', batch_id: batch.batch_id, campaign_id: batch.campaign_id, ip: i.ip, valid: i.valid, listed_on: i.listed_on, inconclusive: i.inconclusive, checked_at: checkedAt })));\nconst lines = [':rotating_light: *Outbound campaign HOLD - sender infrastructure failed pre-flight*', 'Campaign: ' + batch.campaign_id + ' | Batch: ' + batch.batch_id].concat(health.reasons.map((r) => '- ' + r)).concat(health.domains.map((d) => '- ' + d.domain + ': score ' + d.score + ' (' + d.grade + '), blacklist ' + d.blacklist_status));\nreturn [{ json: { source: 'outbound-cold-email-deliverability-engine', batch_id: batch.batch_id, campaign_id: batch.campaign_id, gate: health.gate, gate_reasons: health.reasons, checked_at: checkedAt, records, slack: { text: lines.join(NL) } } }];"
+      },
+      "id": "d774aa2a-46a3-444d-b4a2-f6cfb86d3075",
+      "name": "Build Telemetry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        -112
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TELEMETRY_ENDPOINT_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.TELEMETRY_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $json.source, batch_id: $json.batch_id, campaign_id: $json.campaign_id, gate: $json.gate, gate_reasons: $json.gate_reasons, checked_at: $json.checked_at, records: $json.records }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "e1396eb3-1fc4-4bf3-94bf-9add7355bb59",
+      "name": "Log Domain Telemetry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1312,
+        -192
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "hold-check-0010",
+              "leftValue": "={{ $json.gate }}",
+              "rightValue": "HOLD",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d2122ab4-540a-4603-aeb1-fe4b3b029a58",
+      "name": "Sender HOLD?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1312,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "707cc4c3-dfb2-4e29-b9ab-3a3ca28de995",
+      "name": "Slack - Sender Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1552,
+        -32
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "prescreen-0012",
+              "leftValue": "={{ $json.needs_verification }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "eb9c6a28-a77e-4e2e-91f8-faf3f262e40d",
+      "name": "Pre-Screen Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1072,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "provider-0013",
+              "leftValue": "={{ $json.provider }}",
+              "rightValue": "bounceban",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "126b913c-2da1-40ec-9e9a-4e602690e787",
+      "name": "Provider Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1312,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.bounceban.com/v1/verify/single",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $env.BOUNCEBAN_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5
+            }
+          },
+          "timeout": 90000
+        }
+      },
+      "id": "30f667d2-4ab0-4d46-a958-ca97a34bfe50",
+      "name": "BounceBan Verify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1552,
+        112
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://api.zerobounce.net/v2/validate",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "api_key",
+              "value": "={{ $env.ZEROBOUNCE_API_KEY }}"
+            },
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 10
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "86475483-aaa3-46a4-944b-25420d571383",
+      "name": "ZeroBounce Validate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1552,
+        320
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "id": "9b38d292-e181-4a60-bfaf-398f1adaaffb",
+      "name": "Collect Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1792,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = $json;\nconst skipped = raw.lead_id !== undefined;\nconst lead = skipped ? raw : $('Provider Router').item.json;\nconst cleanMin = Number($env.CLEAN_MIN_SCORE || 80);\nconst riskyMin = Number($env.RISKY_MIN_SCORE || 50);\nconst v = { provider: lead.provider, status: 'not_verified', sub_status: '', is_role: lead.role_based, is_free: lead.free_email, is_catch_all: false, mx_found: null, error: '' };\nif (!skipped) {\n  if (raw.error) {\n    v.error = String(typeof raw.error === 'object' ? (raw.error.message || JSON.stringify(raw.error)) : raw.error);\n  } else if (lead.provider === 'bounceban') {\n    const result = String(raw.result || '').toLowerCase();\n    if (!result) v.error = 'BounceBan returned no result: ' + JSON.stringify(raw).slice(0, 200);\n    v.status = result === 'deliverable' ? 'valid' : result === 'undeliverable' ? 'invalid' : result === 'risky' ? (raw.is_accept_all ? 'catch-all' : 'risky') : 'unknown';\n    v.sub_status = String(raw.reason || raw.message || '');\n    v.is_role = v.is_role || raw.is_role === true;\n    v.is_free = v.is_free || raw.is_free === true;\n    v.is_catch_all = raw.is_accept_all === true;\n    if (raw.is_disposable === true) { v.status = 'invalid'; v.sub_status = 'disposable'; }\n  } else {\n    if (!raw.status) v.error = 'ZeroBounce returned no status: ' + JSON.stringify(raw).slice(0, 200);\n    v.status = String(raw.status || 'unknown').toLowerCase();\n    v.sub_status = String(raw.sub_status || '').toLowerCase();\n    v.is_free = v.is_free || String(raw.free_email) === 'true';\n    v.mx_found = String(raw.mx_found) === 'true';\n    v.is_catch_all = v.status === 'catch-all';\n    if (v.status === 'do_not_mail') {\n      if (v.sub_status === 'role_based') { v.status = 'risky'; v.is_role = true; }\n      else if (v.sub_status === 'role_based_catch_all') { v.status = 'catch-all'; v.is_role = true; v.is_catch_all = true; }\n      else if (v.sub_status === 'disposable') { v.status = 'invalid'; }\n      else { v.status = 'spamtrap'; }\n    }\n  }\n}\nconst BASE = { valid: 92, 'catch-all': 55, risky: 50, unknown: 50, invalid: 0, spamtrap: 0, abuse: 0, not_verified: 0 };\nlet score = BASE[v.status] !== undefined ? BASE[v.status] : 40;\nconst adjustments = [];\nif (v.is_role && score > 0) { score -= 15; adjustments.push('role_based:-15'); }\nscore = Math.max(0, score);\nlet route;\nlet reason;\nlet finalScore = score;\nif (lead.hard_reject_reason) {\n  finalScore = 0;\n  route = lead.hard_reject_reason === 'trap_pattern' ? 'quarantine' : 'reject';\n  reason = lead.hard_reject_reason;\n} else if (v.error) {\n  finalScore = null;\n  route = 'error';\n  reason = 'verification_failed: ' + v.error;\n} else if (v.status === 'not_verified') {\n  finalScore = null;\n  route = 'hold';\n  reason = 'sender_hold_verification_skipped';\n} else if (v.status === 'spamtrap' || v.status === 'abuse') {\n  finalScore = 0;\n  route = 'quarantine';\n  reason = 'provider_flag_' + v.status + (v.sub_status ? '/' + v.sub_status : '');\n} else {\n  route = score >= cleanMin ? 'clean' : (score >= riskyMin ? 'risky' : 'reject');\n  reason = v.status + (v.sub_status ? '/' + v.sub_status : '') + (adjustments.length ? ' [' + adjustments.join(',') + ']' : '');\n  if (lead.campaign_gate === 'HOLD' && (route === 'clean' || route === 'risky')) {\n    reason = 'sender_hold (' + route + '): ' + (lead.campaign_gate_reasons || []).join('; ');\n    route = 'hold';\n  }\n}\nconst scoredAt = new Date().toISOString();\nconst properties = { deliverability_route: route, deliverability_status: v.status, deliverability_reason: String(reason).slice(0, 250), deliverability_score: finalScore === null ? '' : finalScore, email_verification_provider: v.provider, deliverability_batch_id: lead.batch_id, deliverability_campaign_id: lead.campaign_id };\nif (!skipped && !v.error) properties.email_verified_at = scoredAt;\nif (lead.first_name) properties.firstname = lead.first_name;\nif (lead.last_name) properties.lastname = lead.last_name;\nif (lead.company) properties.company = lead.company;\nreturn { json: { lead_id: lead.lead_id, batch_id: lead.batch_id, campaign_id: lead.campaign_id, email: lead.email, domain: lead.domain, route, reason, score: finalScore, verification: v, adjustments, hard_reject_reason: lead.hard_reject_reason, dns: lead.dns, campaign_gate: lead.campaign_gate, duplicates_dropped: lead.duplicates_dropped, crm_writable: lead.syntax_valid === true, crm_payload: { inputs: [{ id: lead.email, idProperty: 'email', properties }] }, scored_at: scoredAt } };"
+      },
+      "id": "88c4ef14-c131-4c31-9af2-e1c773992c6b",
+      "name": "Score and Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2032,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 6,
+        "output": "={{ ({ clean: 0, risky: 1, reject: 2, quarantine: 3, hold: 4, error: 5 })[$json.route] ?? 5 }}"
+      },
+      "id": "7e3b86ee-b251-4a7d-8303-31015ba0926d",
+      "name": "Route Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        2272,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "crmwritable-0019",
+              "leftValue": "={{ $json.crm_writable }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cf96424a-5a8c-4e23-a1e8-5dc87d522fb8",
+      "name": "CRM Writable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2512,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.CRM_BASE_URL || 'https://api.hubapi.com') + '/crm/v3/objects/contacts/batch/upsert' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.CRM_API_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.crm_payload) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "36cb3b62-6d08-48f3-b093-b75ed3497d97",
+      "name": "Upsert CRM Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2752,
+        112
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map((i) => i.json);\nconst batch = $('Validate Payload').first().json;\nconst NL = String.fromCharCode(10);\nconst total = items.length;\nconst pct = (n) => (total ? Math.round((n / total) * 100) : 0) + '%';\nconst counts = { clean: 0, risky: 0, reject: 0, quarantine: 0, hold: 0, error: 0 };\nitems.forEach((i) => { counts[i.route] = (counts[i.route] || 0) + 1; });\nconst scored = items.filter((i) => typeof i.score === 'number');\nconst avg = scored.length ? Math.round(scored.reduce((s, i) => s + i.score, 0) / scored.length) : 0;\nconst reasons = {};\nitems.filter((i) => i.route === 'reject' || i.route === 'quarantine').forEach((i) => { const k = String(i.reason).split(':')[0].split('/')[0].split(' ')[0]; reasons[k] = (reasons[k] || 0) + 1; });\nconst topReasons = Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 5).map((e) => e[0] + ' x' + e[1]).join(', ');\nconst unwritable = items.filter((i) => !i.crm_writable).length;\nconst gate = $('DNS Check').first().json.campaign_gate;\nconst lines = [':bar_chart: *Deliverability batch complete*', 'Campaign: ' + batch.campaign_id + ' | Batch: ' + batch.batch_id, 'Leads processed: ' + total + ' (duplicates dropped: ' + (items[0].duplicates_dropped || 0) + ') | Avg score: ' + avg, 'Sender gate: ' + gate, 'Clean: ' + counts.clean + ' (' + pct(counts.clean) + ') | Risky: ' + counts.risky + ' | Reject: ' + counts.reject + ' | Quarantine: ' + counts.quarantine + ' | Hold: ' + counts.hold + ' | Error: ' + counts.error, 'Not writable to CRM (no valid email): ' + unwritable];\nif (topReasons) lines.push('Top suppression reasons: ' + topReasons);\nreturn [{ json: { batch_id: batch.batch_id, campaign_id: batch.campaign_id, counts, avg_score: avg, gate, slack: { text: lines.join(NL) } } }];"
+      },
+      "id": "c47f65cd-65d9-40ed-a5cc-b41c4b2b6059",
+      "name": "Build Batch Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2272,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "ff2b171f-9446-4e0d-a3dc-cdd999d8779a",
+      "name": "Slack - Batch Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2512,
+        -32
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map((i) => i.json);\nconst batch = $('Validate Payload').first().json;\nconst NL = String.fromCharCode(10);\nconst first = items[0];\nconst lines = [':warning: *Email verification failures*', 'Campaign: ' + batch.campaign_id + ' | Batch: ' + batch.batch_id, items.length + ' lead(s) could not be verified and were NOT released for dispatch.', 'Provider: ' + first.verification.provider, 'First error: ' + String(first.reason).slice(0, 300), 'Action: check API key, credits and rate limits, then resubmit the failed leads.'];\nreturn [{ json: { failed_emails: items.map((i) => i.email), slack: { text: lines.join(NL) } } }];"
+      },
+      "id": "46a58ac8-8ea3-4aea-9ff5-04f08a3ec7f1",
+      "name": "Format Verification Errors",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2512,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map((i) => i.json);\nconst batch = $('Validate Payload').first().json;\nconst NL = String.fromCharCode(10);\nconst err = items[0].error;\nconst msg = err && typeof err === 'object' ? (err.message || JSON.stringify(err)) : String(err || 'unknown error');\nconst sample = items.slice(0, 10).map((i) => '- ' + (i.email || 'unknown') + ' (' + (i.route || 'n/a') + ')');\nconst lines = [':x: *CRM upsert failures*', 'Campaign: ' + batch.campaign_id + ' | Batch: ' + batch.batch_id, items.length + ' contact(s) were NOT tagged in the CRM.', 'Error: ' + String(msg).slice(0, 300)].concat(sample);\nreturn [{ json: { failed_emails: items.map((i) => i.email || ''), slack: { text: lines.join(NL) } } }];"
+      },
+      "id": "e16283fe-2972-4b0a-a394-95209cd4473a",
+      "name": "Format CRM Errors",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2992,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "c7d7a436-8caa-4391-8a8e-f61a486f0258",
+      "name": "Slack - Error Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3232,
+        320
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook Ingestion": {
+      "main": [
+        [
+          {
+            "node": "Validate Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payload": {
+      "main": [
+        [
+          {
+            "node": "Payload Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Payload Valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond 202 Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 4xx Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202 Accepted": {
+      "main": [
+        [
+          {
+            "node": "Prepare Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Leads": {
+      "main": [
+        [
+          {
+            "node": "DNS Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DNS Check": {
+      "main": [
+        [
+          {
+            "node": "Build Telemetry",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Pre-Screen Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Telemetry": {
+      "main": [
+        [
+          {
+            "node": "Log Domain Telemetry",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Sender HOLD?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sender HOLD?": {
+      "main": [
+        [
+          {
+            "node": "Slack - Sender Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-Screen Gate": {
+      "main": [
+        [
+          {
+            "node": "Provider Router",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Collect Results",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Provider Router": {
+      "main": [
+        [
+          {
+            "node": "BounceBan Verify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ZeroBounce Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ZeroBounce Validate": {
+      "main": [
+        [
+          {
+            "node": "Collect Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BounceBan Verify": {
+      "main": [
+        [
+          {
+            "node": "Collect Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Collect Results": {
+      "main": [
+        [
+          {
+            "node": "Score and Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score and Route": {
+      "main": [
+        [
+          {
+            "node": "Route Switch",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Batch Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Batch Summary": {
+      "main": [
+        [
+          {
+            "node": "Slack - Batch Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Switch": {
+      "main": [
+        [
+          {
+            "node": "CRM Writable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CRM Writable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CRM Writable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CRM Writable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CRM Writable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Verification Errors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CRM Writable?": {
+      "main": [
+        [
+          {
+            "node": "Upsert CRM Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert CRM Contact": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Format CRM Errors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Verification Errors": {
+      "main": [
+        [
+          {
+            "node": "Slack - Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format CRM Errors": {
+      "main": [
+        [
+          {
+            "node": "Slack - Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0bce6134-b10c-4761-ba42-0b16b32af0a6",
+  "meta": {
+    "instanceId": "9f337e234239f157a65c750ec6e9efa025524afc8e3f6d67e42e0c1b6be035a8"
+  },
+  "nodeGroups": [],
+  "id": "tu4uNDUEX51848aK",
+  "tags": []
+}
